@@ -1,0 +1,1828 @@
+
+#A tool to load data into Veeva Vault CRM 
+import os
+import sys
+import json
+import pandas as pd
+import subprocess
+import requests
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter.font import Font
+from datetime import date
+import logging
+import smtplib
+import time
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import COMMASPACE
+from io import StringIO
+import tempfile
+import configparser
+import re
+import urllib3
+from openpyxl import load_workbook
+import csv
+import traceback
+
+# Suppress InsecureRequestWarning when SSL verification is disabled
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Global configuration
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".veeva_vault_manager")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.ini")
+
+# Custom styling
+MAIN_BG = "#f5f5f7"  # Light background
+ACCENT_COLOR = "#0071e3"  # Blue accent
+LIGHT_ACCENT = "#e8f4fc"
+SECTION_BG = "white"
+TEXT_COLOR = "#333333"
+HELP_COLOR = "#717171"
+SUCCESS_COLOR = "#34c759"
+ERROR_COLOR = "#ff3b30"
+WARNING_COLOR = "#ff9500"
+INFO_COLOR = "#5ac8fa"
+
+# Make sure config directory exists
+if not os.path.exists(CONFIG_DIR):
+    os.makedirs(CONFIG_DIR)
+
+class ToolTip:
+    """
+    Creates a tooltip for a given widget
+    """
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tooltip = None
+        self.widget.bind("<Enter>", self.show_tooltip)
+        self.widget.bind("<Leave>", self.hide_tooltip)
+    
+    def show_tooltip(self, event=None):
+        x, y, _, _ = self.widget.bbox("insert")
+        x += self.widget.winfo_rootx() + 25
+        y += self.widget.winfo_rooty() + 25
+        
+        # Create a toplevel window
+        self.tooltip = tk.Toplevel(self.widget)
+        self.tooltip.wm_overrideredirect(True)
+        self.tooltip.wm_geometry(f"+{x}+{y}")
+        
+        label = ttk.Label(self.tooltip, text=self.text, wraplength=250,
+                         background=LIGHT_ACCENT, foreground=TEXT_COLOR,
+                         relief="solid", borderwidth=1, padding=(5, 3))
+        label.pack()
+    
+    def hide_tooltip(self, event=None):
+        if self.tooltip:
+            self.tooltip.destroy()
+            self.tooltip = None
+
+class VeevaVaultManager:
+    def validate_batch_size(self, value):
+            """Validate the batch size input"""
+            # Allow empty field for backspace/delete operations
+            if not value:
+                return True
+                
+            # Check if it's a positive integer
+            try:
+                val = int(value)
+                
+                # Get the maximum allowed based on operation
+                max_allowed = 10 if self.crud_operation_var.get() == "merge" else 500
+                
+                if 1 <= val <= max_allowed:
+                    return True
+                else:
+                    self.root.bell()  # Sound alert
+                    return False
+            except ValueError:
+                self.root.bell()  # Sound alert
+                return False    
+    def update_crud_operation(self):
+            """Update UI based on selected CRUD operation"""
+            operation = self.crud_operation_var.get()
+            
+            # Show or hide mapping frame based on operation
+            if operation == "merge":
+                self.mapping_frame.pack_forget()
+                self.log_message("Merge operation selected. Column mapping not required.", "INFO")
+                
+                # Set max batch size to 10 for merge
+                self.batch_size_var.set(min(10, self.batch_size_var.get()))
+                self.batch_size_spinbox.config(from_=1, to=10)
+                self.batch_info_label.config(text="(Max batch size: 10 for Merge)")
+            else:
+                if self.operation_var.get() == "push":  # Only show mapping for push operations
+                    self.mapping_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+                
+                # Set default batch size to 200 for other operations
+                if operation in ["insert", "update"]:
+                    if self.batch_size_var.get() <= 10:  # If coming from merge, reset to default
+                        self.batch_size_var.set(200)
+                    self.batch_size_spinbox.config(from_=1, to=500)
+                    self.batch_info_label.config(text="(Default: 200 for Insert/Update)")
+                
+            # Update batch size information in tooltips
+            if operation == "merge":
+                if hasattr(self, 'target_object_combo'):
+                    ToolTip(self.target_object_combo, "Select the target Veeva Vault object (direct merge, no mapping required)")
+            else:
+                if hasattr(self, 'target_object_combo'):
+                    ToolTip(self.target_object_combo, "Select the target Veeva Vault object")    
+    def setup_combobox_autocomplete(self, combobox):
+            """Set up autocomplete for a combobox"""
+            
+            # Store the original values list for matching not working sometimes :(
+            combobox.all_values = []
+            
+            def on_keyrelease(event):
+                """Handle key release to update dropdown options"""
+                # Get the current text
+                value = event.widget.get().lower()
+                
+                if value:
+                    # Filter the values list for matching entries
+                    filtered_values = [item for item in combobox.all_values if value in item.lower()]
+                    combobox['values'] = filtered_values
+                    
+                    # Show dropdown if we have matches and it's not already posted
+                    if filtered_values and not combobox.winfo_ismapped():
+                        combobox.event_generate('<Down>')
+                else:
+                    # If no text, reset to all values
+                    combobox['values'] = combobox.all_values
+            
+            def on_values_changed(widget):
+                """Update the stored original values when they change"""
+                widget.all_values = list(widget['values'])
+            
+            # Bind events
+            combobox.bind('<KeyRelease>', on_keyrelease)
+            
+            # Trace changes to values
+            combobox._values_trace = combobox.configure
+            combobox._orig_configure = combobox.configure
+            
+            def custom_configure(*args, **kwargs):
+                """Override configure to track value changes"""
+                if 'values' in kwargs:
+                    combobox.all_values = list(kwargs['values'])
+                return combobox._orig_configure(*args, **kwargs)
+            
+            combobox.configure = custom_configure
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Veeva Vault Manager")
+        self.root.geometry("1000x780")
+        self.root.configure(bg=MAIN_BG)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.batch_size_var=200
+        # Load configuration if exists
+        self.config = configparser.ConfigParser()
+        if os.path.exists(CONFIG_FILE):
+            self.config.read(CONFIG_FILE)
+        
+        # Set up variables
+        self.operation_var = tk.StringVar(value="pull")
+        self.crud_operation_var = tk.StringVar(value="insert")
+        self.email_notification_var = tk.BooleanVar(value=True)
+        self.input_file_var = tk.StringVar()
+        self.output_file_var = tk.StringVar()
+        self.output_format_var = tk.StringVar(value="csv")
+        self.api_url_var = tk.StringVar()
+        self.username_var = tk.StringVar()
+        self.password_var = tk.StringVar()
+        self.selected_object_var = tk.StringVar()
+        self.verify_ssl_var = tk.BooleanVar(value=True)
+        
+        # Column mapping dictionary
+        self.column_mappings = {}
+        self.available_vault_fields = []
+        self.df = None
+        
+        # Create main frame
+        self.main_frame = ttk.Frame(self.root, padding=10, style="Main.TFrame")
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Configure ttk styles
+        self.configure_styles()
+        
+        # Build UI
+        self.create_header()
+        self.create_connection_frame()
+        self.create_operation_frame()
+        self.create_data_frame()
+        self.create_column_mapping_frame()
+        self.create_execution_frame()
+        self.create_log_frame()
+        self.create_footer()
+        
+        # Load saved configurations
+        self.load_saved_config()
+        
+        # Update UI state based on operation
+        self.update_ui_for_operation()
+
+    def configure_styles(self):
+        """Configure ttk styles for a modern look"""
+        style = ttk.Style()
+        
+        # Configure frame styles
+        style.configure("Main.TFrame", background=MAIN_BG)
+        style.configure("Section.TFrame", background=SECTION_BG)
+        
+        # Configure label styles
+        style.configure("TLabel", background=SECTION_BG, foreground=TEXT_COLOR)
+        style.configure("Header.TLabel", background=SECTION_BG, foreground=TEXT_COLOR, font=("Helvetica", 14, "bold"))
+        style.configure("Title.TLabel", background=MAIN_BG, foreground=TEXT_COLOR, font=("Helvetica", 18, "bold"))
+        style.configure("SectionHeader.TLabel", background=SECTION_BG, foreground=TEXT_COLOR, font=("Helvetica", 12, "bold"))
+        
+        # Configure button styles
+        style.configure("Accent.TButton", background=ACCENT_COLOR, foreground="black")
+        style.map("Accent.TButton", background=[("active", "#0058b9")])
+        
+        # Configure entry styles
+        style.configure("TEntry", fieldbackground="white")
+        
+        # Configure combobox styles
+        style.configure("TCombobox", fieldbackground="white")
+        
+        # Configure scale styles
+        style.configure("TScale", background=SECTION_BG)
+    
+    def create_header(self):
+        """Create the application header"""
+        header_frame = ttk.Frame(self.main_frame, style="Main.TFrame")
+        header_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        title_label = ttk.Label(header_frame, text="Veeva Vault Manager", style="Title.TLabel")
+        title_label.pack(side=tk.LEFT)
+        
+        # Help button
+        help_button = ttk.Button(header_frame, text="Help", command=self.show_help)
+        help_button.pack(side=tk.RIGHT)
+    
+    def create_connection_frame(self):
+        """Create the connection configuration frame"""
+        frame = ttk.LabelFrame(self.main_frame, text="Veeva Vault Connection", padding=10, style="Section.TFrame")
+        frame.pack(fill=tk.X, pady=5)
+        
+        # Create a grid layout
+        for i in range(3):
+            frame.columnconfigure(i, weight=1)
+        
+        # API URL, Username, Password
+        ttk.Label(frame, text="API URL:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        api_url_entry = ttk.Entry(frame, textvariable=self.api_url_var, width=40)
+        api_url_entry.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=5)
+        ToolTip(api_url_entry, "The Veeva Vault API URL (e.g., https://yourcompany.veevavault.com)")
+        
+        ttk.Label(frame, text="Username:").grid(row=0, column=2, sticky=tk.W, padx=5, pady=5)
+        username_entry = ttk.Entry(frame, textvariable=self.username_var)
+        username_entry.grid(row=0, column=3, sticky=tk.EW, padx=5, pady=5)
+        
+        ttk.Label(frame, text="Password:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        password_entry = ttk.Entry(frame, textvariable=self.password_var, show="*")
+        password_entry.grid(row=1, column=1, sticky=tk.EW, padx=5, pady=5)
+        
+        # SSL verification option
+        self.verify_ssl_var = tk.BooleanVar(value=True)
+        ssl_check = ttk.Checkbutton(frame, text="Verify SSL Certificate", variable=self.verify_ssl_var)
+        ssl_check.grid(row=1, column=2, sticky=tk.W, padx=5, pady=5)
+        ToolTip(ssl_check, "Disable this if having SSL certificate verification issues")
+        
+        # Test connection button
+        test_button = ttk.Button(frame, text="Test Connection", command=self.test_connection)
+        test_button.grid(row=1, column=3, sticky=tk.E, padx=5, pady=5)
+    
+    def create_operation_frame(self):
+        """Create the operation selection frame"""
+        frame = ttk.LabelFrame(self.main_frame, text="Operation", padding=10, style="Section.TFrame")
+        frame.pack(fill=tk.X, pady=5)
+        
+        # Operation type (pull/push)
+        op_frame = ttk.Frame(frame, style="Section.TFrame")
+        op_frame.pack(fill=tk.X)
+        
+        ttk.Radiobutton(op_frame, text="Pull data from Veeva Vault", variable=self.operation_var, 
+                       value="pull", command=self.update_ui_for_operation).pack(side=tk.LEFT, padx=10)
+        ToolTip(op_frame.winfo_children()[-1], "Download data from Veeva Vault to CSV/Excel file")
+        
+        ttk.Radiobutton(op_frame, text="Push data to Veeva Vault", variable=self.operation_var, 
+                       value="push", command=self.update_ui_for_operation).pack(side=tk.LEFT, padx=10)
+        ToolTip(op_frame.winfo_children()[-1], "Upload data from local CSV/Excel to Veeva Vault")
+        
+        # CRUD operations (for push)
+        self.crud_frame = ttk.Frame(frame, style="Section.TFrame")
+        self.crud_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        ttk.Label(self.crud_frame, text="CRUD Operation:").pack(side=tk.LEFT, padx=(0, 10))
+        
+        for operation in ["Insert", "Update", "Delete", "Merge"]:
+            rb = ttk.Radiobutton(self.crud_frame, text=operation, variable=self.crud_operation_var, 
+                               value=operation.lower(), command=self.update_crud_operation)
+            rb.pack(side=tk.LEFT, padx=10)
+            tooltip_text = {
+                "Insert": "Add new records to Veeva Vault",
+                "Update": "Update existing records in Veeva Vault",
+                "Delete": "Remove records from Veeva Vault",
+                "Merge": "Merge data with existing records (no mapping required)"
+            }
+            ToolTip(rb, tooltip_text[operation])
+        
+        # Batch size frame
+        self.batch_frame = ttk.Frame(frame, style="Section.TFrame")
+        self.batch_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        ttk.Label(self.batch_frame, text="Batch Size:").pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Create a spinbox for batch size input
+        vcmd = (self.root.register(self.validate_batch_size), '%P')
+        self.batch_size_spinbox = ttk.Spinbox(self.batch_frame, from_=1, to=500, 
+                                            textvariable=self.batch_size_var, width=5,
+                                            validate="key", validatecommand=vcmd)
+        self.batch_size_spinbox.pack(side=tk.LEFT, padx=5)
+        ToolTip(self.batch_size_spinbox, "Number of records to process in each batch. Max 500 for insert/update, max 10 for merge.")
+        
+        # Batch size info label
+        self.batch_info_label = ttk.Label(self.batch_frame, text="(Default: 200 for Insert/Update, 10 for Merge)")
+        self.batch_info_label.pack(side=tk.LEFT, padx=10)
+        
+        # Email notification checkbox
+        self.email_frame = ttk.Frame(frame, style="Section.TFrame")
+        self.email_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        email_cb = ttk.Checkbutton(self.email_frame, text="Send email notification", variable=self.email_notification_var)
+        email_cb.pack(side=tk.LEFT)
+        ToolTip(email_cb, "Send an email report after operation completes")
+        
+        # Email settings
+        self.email_settings_frame = ttk.Frame(self.email_frame, style="Section.TFrame")
+        self.email_settings_frame.pack(side=tk.RIGHT)
+        
+        email_settings_btn = ttk.Button(self.email_settings_frame, text="Email Settings", command=self.show_email_settings)
+        email_settings_btn.pack(side=tk.RIGHT)
+    
+    def create_data_frame(self):
+        """Create the data selection frame"""
+        self.data_frame = ttk.LabelFrame(self.main_frame, text="Data Configuration", padding=10, style="Section.TFrame")
+        self.data_frame.pack(fill=tk.X, pady=5)
+        
+        # Create frames for pull and push operations
+        self.pull_frame = ttk.Frame(self.data_frame, style="Section.TFrame")
+        self.push_frame = ttk.Frame(self.data_frame, style="Section.TFrame")
+        
+        # Pull operation frame content
+        ttk.Label(self.pull_frame, text="Veeva Object:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        self.object_combo = ttk.Combobox(self.pull_frame, textvariable=self.selected_object_var)
+        self.object_combo.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=5)
+        ToolTip(self.object_combo, "Select or type the Veeva Vault object to download")
+        
+        fetch_objects_btn = ttk.Button(self.pull_frame, text="Fetch Objects", command=self.fetch_vault_objects)
+        fetch_objects_btn.grid(row=0, column=2, padx=5, pady=5)
+        
+        ttk.Label(self.pull_frame, text="Output File:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        output_file_entry = ttk.Entry(self.pull_frame, textvariable=self.output_file_var, width=50)
+        output_file_entry.grid(row=1, column=1, sticky=tk.EW, padx=5, pady=5)
+        
+        browse_output_btn = ttk.Button(self.pull_frame, text="Browse", command=self.browse_output_file)
+        browse_output_btn.grid(row=1, column=2, padx=5, pady=5)
+        
+        # Output format options
+        format_frame = ttk.Frame(self.pull_frame, style="Section.TFrame")
+        format_frame.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=5, pady=5)
+        
+        ttk.Label(format_frame, text="Output Format:").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Radiobutton(format_frame, text="CSV", variable=self.output_format_var, value="csv").pack(side=tk.LEFT, padx=10)
+        ttk.Radiobutton(format_frame, text="Excel", variable=self.output_format_var, value="excel").pack(side=tk.LEFT, padx=10)
+        
+        # Push operation frame content
+        ttk.Label(self.push_frame, text="Input File:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+        input_file_entry = ttk.Entry(self.push_frame, textvariable=self.input_file_var, width=50)
+        input_file_entry.grid(row=0, column=1, sticky=tk.EW, padx=5, pady=5)
+        
+        browse_btn = ttk.Button(self.push_frame, text="Browse", command=self.browse_input_file)
+        browse_btn.grid(row=0, column=2, padx=5, pady=5)
+        
+        ttk.Label(self.push_frame, text="Target Object:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+        self.target_object_combo = ttk.Combobox(self.push_frame, textvariable=self.selected_object_var)
+        self.target_object_combo.grid(row=1, column=1, sticky=tk.EW, padx=5, pady=5)
+        ToolTip(self.target_object_combo, "Select or type the target Veeva Vault object")
+        
+        fetch_objects_btn2 = ttk.Button(self.push_frame, text="Fetch Objects", command=self.fetch_vault_objects)
+        fetch_objects_btn2.grid(row=1, column=2, padx=5, pady=5)
+        
+        # Configure grid weights
+        for frame in [self.pull_frame, self.push_frame]:
+            frame.columnconfigure(1, weight=1)
+        
+        # Set up autocomplete for comboboxes
+        self.setup_combobox_autocomplete(self.object_combo)
+        self.setup_combobox_autocomplete(self.target_object_combo)
+    
+    def create_column_mapping_frame(self):
+        """Create the column mapping frame (for push operations)"""
+        self.mapping_frame = ttk.LabelFrame(self.main_frame, text="Column Mapping", padding=10, style="Section.TFrame")
+        self.mapping_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Buttons frame
+        buttons_frame = ttk.Frame(self.mapping_frame, style="Section.TFrame")
+        buttons_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        auto_map_btn = ttk.Button(buttons_frame, text="Auto-Map Columns", command=self.auto_map_columns)
+        auto_map_btn.pack(side=tk.LEFT, padx=5)
+        ToolTip(auto_map_btn, "Automatically match file columns with Vault fields where possible")
+        
+        clear_map_btn = ttk.Button(buttons_frame, text="Clear Mappings", command=self.clear_mappings)
+        clear_map_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Mapping container (scrollable)
+        mapping_container = ttk.Frame(self.mapping_frame, style="Section.TFrame")
+        mapping_container.pack(fill=tk.BOTH, expand=True)
+        
+        # Canvas for scrolling
+        self.canvas = tk.Canvas(mapping_container, background=SECTION_BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(mapping_container, orient="vertical", command=self.canvas.yview)
+        
+        self.mapping_content = ttk.Frame(self.canvas, style="Section.TFrame")
+        self.mapping_content.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        
+        self.canvas.create_window((0, 0), window=self.mapping_content, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Add mouse wheel scrolling
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        
+        # Headers
+        ttk.Label(self.mapping_content, text="File Column", font=("Helvetica", 10, "bold")).grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        ttk.Label(self.mapping_content, text="Vault Field", font=("Helvetica", 10, "bold")).grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
+        ttk.Label(self.mapping_content, text="Preview Data", font=("Helvetica", 10, "bold")).grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
+    
+    def _on_mousewheel(self, event):
+        """Handle mouse wheel scrolling"""
+        self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+    
+    def create_execution_frame(self):
+        """Create the execution control frame"""
+        frame = ttk.Frame(self.main_frame, padding=10, style="Section.TFrame")
+        frame.pack(fill=tk.X, pady=5)
+        
+        self.progress = ttk.Progressbar(frame, mode="indeterminate", length=300)
+        self.progress.pack(side=tk.LEFT, padx=(0, 10), fill=tk.X, expand=True)
+        
+        self.status_label = ttk.Label(frame, text="Ready", style="TLabel")
+        self.status_label.pack(side=tk.LEFT, padx=10)
+        
+        execute_btn = ttk.Button(frame, text="Execute", command=self.execute_operation, style="Accent.TButton")
+        execute_btn.pack(side=tk.RIGHT, padx=5)
+        
+        save_config_btn = ttk.Button(frame, text="Save Configuration", command=self.save_configuration)
+        save_config_btn.pack(side=tk.RIGHT, padx=5)
+    
+    def create_log_frame(self):
+        """Create the log display frame"""
+        frame = ttk.LabelFrame(self.main_frame, text="Logs", padding=10, style="Section.TFrame")
+        frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        self.log_text = scrolledtext.ScrolledText(frame, height=6, wrap=tk.WORD, 
+                                               background=SECTION_BG, foreground=TEXT_COLOR)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.log_text.configure(state="disabled")
+        
+        # Set up custom logging handler
+        self.log_handler = TextHandler(self.log_text)
+        self.logger = self.setup_logger()
+    
+    def create_footer(self):
+        """Create the footer with application info"""
+        footer_frame = ttk.Frame(self.main_frame, style="Main.TFrame")
+        footer_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        version_label = ttk.Label(footer_frame, text="Version 1.0.4", style="TLabel")
+        version_label.pack(side=tk.RIGHT)
+        
+        copyright_label = ttk.Label(footer_frame, text="© 2025 Veeva Vault Manager | sc22950", style="TLabel")
+        copyright_label.pack(side=tk.LEFT)
+    
+    def setup_logger(self):
+        """Set up and configure the logger"""
+        logger = logging.getLogger("VeevaVaultManager")
+        logger.setLevel(logging.INFO)
+        
+        # Add the custom handler
+        logger.addHandler(self.log_handler)
+        
+        return logger
+    
+    def log_message(self, message, level="INFO"):
+        """Log a message to the log text widget"""
+        if level == "INFO":
+            self.logger.info(message)
+        elif level == "ERROR":
+            self.logger.error(message)
+        elif level == "WARNING":
+            self.logger.warning(message)
+        elif level == "DEBUG":
+            self.logger.debug(message)
+    
+    def update_ui_for_operation(self):
+        """Update UI elements based on selected operation"""
+        operation = self.operation_var.get()
+        
+        # Show/hide relevant frames
+        if operation == "pull":
+            self.pull_frame.pack(fill=tk.X)
+            self.push_frame.pack_forget()
+            self.crud_frame.pack_forget()
+            self.batch_frame.pack_forget()
+            self.mapping_frame.pack_forget()
+            self.email_frame.pack(fill=tk.X)
+        else:  # push
+            self.push_frame.pack(fill=tk.X)
+            self.pull_frame.pack_forget()
+            self.crud_frame.pack(fill=tk.X)
+            self.batch_frame.pack(fill=tk.X, pady=(10, 0))
+            
+            # Only show mapping frame if not in merge mode
+            if self.crud_operation_var.get() != "merge":
+                self.mapping_frame.pack(fill=tk.BOTH, expand=True)
+            else:
+                self.mapping_frame.pack_forget()
+                
+            self.email_frame.pack(fill=tk.X)
+            
+            # Update batch size settings based on operation
+            self.update_crud_operation()
+    
+    def browse_input_file(self):
+        """Open file dialog to select input file"""
+        filetypes = [
+            ("All Supported Files", "*.csv *.xlsx *.xls"),
+            ("CSV Files", "*.csv"),
+            ("Excel Files", "*.xlsx *.xls")
+        ]
+        
+        filename = filedialog.askopenfilename(title="Select Input File", filetypes=filetypes)
+        if filename:
+            self.input_file_var.set(filename)
+            self.load_input_file(filename)
+    
+    def browse_output_file(self):
+        """Open file dialog to select output file"""
+        if self.output_format_var.get() == "csv":
+            filetypes = [("CSV Files", "*.csv")]
+            defaultextension = ".csv"
+        else:
+            filetypes = [("Excel Files", "*.xlsx")]
+            defaultextension = ".xlsx"
+        
+        filename = filedialog.asksaveasfilename(
+            title="Save Output File As",
+            filetypes=filetypes,
+            defaultextension=defaultextension
+        )
+        
+        if filename:
+            self.output_file_var.set(filename)
+    
+    def load_input_file(self, filename):
+        """Load the selected input file"""
+        try:
+            ext = os.path.splitext(filename)[1].lower()
+            
+            if ext == '.csv':
+                self.df = pd.read_csv(filename)
+            elif ext in ['.xlsx', '.xls']:
+                self.df = pd.read_excel(filename)
+            else:
+                messagebox.showerror("Error", "Unsupported file format")
+                return
+            
+            self.log_message(f"Loaded file with {len(self.df.columns)} columns and {len(self.df)} rows")
+            
+            # If we have a target object selected and vault fields loaded, only then attempt automapping
+            if self.selected_object_var.get() and self.available_vault_fields:
+                self.auto_map_columns()
+            else:
+                # Just show the file columns without mapping
+                self.populate_mapping_ui(auto_map=False)
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load file: {str(e)}")
+            self.logger.error(f"Failed to load file: {str(e)}")
+    
+    def fetch_vault_objects(self):
+        """Fetch available objects from Veeva Vault"""
+        # Check if we have connection details
+        if not all([self.api_url_var.get(), self.username_var.get(), self.password_var.get()]):
+            messagebox.showerror("Error", "Please provide Veeva Vault API URL, username, and password")
+            return
+        
+        # Now fetch objects
+        try:
+            self.status_label.config(text="Connecting to Vault...")
+            self.progress.start()
+            
+            # Run in a separate thread to keep UI responsive
+            threading.Thread(target=self._fetch_objects_thread, daemon=True).start()
+        
+        except Exception as e:
+            self.progress.stop()
+            self.status_label.config(text="Error")
+            messagebox.showerror("Error", f"Failed to connect to Vault: {str(e)}")
+    
+    def _fetch_objects_thread(self):
+        """Worker thread to fetch Vault objects"""
+        try:
+            # Set SSL verification option from checkbox
+            self.verify_ssl = self.verify_ssl_var.get()
+            
+            session_id = self.get_sessionid()
+            
+            if not session_id:
+                self.root.after(0, lambda: messagebox.showerror("Error", "Failed to get Vault session"))
+                self.root.after(0, lambda: self.status_label.config(text="Connection failed"))
+                self.root.after(0, self.progress.stop)
+                return
+            
+            headers_post = {
+                'Accept': 'application/json', 
+                'Authorization': f"Bearer {session_id}",
+                'Content-Type': 'application/json'
+            }
+            
+            # Get available objects
+            api_url = f"{self.api_url_var.get()}/api/v24.1/metadata/vobjects"
+            
+            # Use same SSL verification setting
+            response = requests.get(
+                api_url, 
+                headers=headers_post, 
+                verify=self.verify_ssl,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                objects = [obj['name'] for obj in data['objects']]
+                
+                # Store objects in a class variable to avoid threading issues
+                self.vault_objects = objects
+                
+                # Update UI from main thread
+                self.root.after(0, lambda: self.update_object_combos())
+                self.root.after(0, lambda: self.status_label.config(text="Objects loaded"))
+                self.root.after(0, lambda: self.log_message(f"Loaded {len(objects)} Vault objects"))
+            else:
+                error_msg = f"Failed to get objects: {response.status_code}"
+                self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+                self.root.after(0, lambda: self.status_label.config(text="Error"))
+                self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+        
+        except requests.exceptions.SSLError as e:
+            error_msg = f"SSL Certificate Error: {str(e)}"
+            self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+            self.root.after(0, lambda: messagebox.showerror("SSL Error", "SSL Certificate verification failed. Try disabling SSL verification."))
+            
+        except requests.exceptions.Timeout as e:
+            error_msg = "Connection timed out. The server took too long to respond."
+            self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+            self.root.after(0, lambda: messagebox.showerror("Timeout Error", error_msg))
+            
+        except Exception as e:
+            error_msg = f"Error fetching objects: {str(e)}"
+            self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+            self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+        
+        finally:
+            self.root.after(0, self.progress.stop)
+    
+    def update_object_combos(self):
+        """Update object comboboxes with fetched objects"""
+        if hasattr(self, 'vault_objects'):
+            # Sort the objects alphabetically
+            sorted_objects = sorted(self.vault_objects)
+            
+            self.object_combo['values'] = sorted_objects
+            self.target_object_combo['values'] = sorted_objects
+            
+            # Bind the combobox selection event
+            self.object_combo.bind("<<ComboboxSelected>>", self.on_object_selected)
+            self.target_object_combo.bind("<<ComboboxSelected>>", self.on_object_selected)
+    
+    def on_object_selected(self, event):
+        """Handle object selection events"""
+        selected_object = self.selected_object_var.get()
+        
+        if selected_object:
+            # Fetch fields for this object
+            self.fetch_object_fields(selected_object)
+            
+            # Default output filename (for pull operation)
+            if self.operation_var.get() == "pull" and not self.output_file_var.get():
+                output_dir = os.path.join(os.path.expanduser("~"), "Documents")
+                if not os.path.exists(output_dir):
+                    output_dir = os.path.expanduser("~")
+                
+                ext = ".csv" if self.output_format_var.get() == "csv" else ".xlsx"
+                default_filename = os.path.join(output_dir, f"{selected_object}{ext}")
+                self.output_file_var.set(default_filename)
+    
+    def fetch_object_fields(self, object_name):
+        """Fetch fields for the selected object"""
+        try:
+            self.status_label.config(text="Fetching fields...")
+            self.progress.start()
+            
+            # Run in a separate thread
+            threading.Thread(target=self._fetch_fields_thread, args=(object_name,), daemon=True).start()
+        
+        except Exception as e:
+            self.progress.stop()
+            self.status_label.config(text="Error")
+            messagebox.showerror("Error", f"Failed to fetch fields: {str(e)}")
+    
+    def _fetch_fields_thread(self, object_name):
+        """Worker thread to fetch object fields"""
+        try:
+            # Set SSL verification option from checkbox
+            self.verify_ssl = self.verify_ssl_var.get()
+            
+            session_id = self.get_sessionid()
+            
+            if not session_id:
+                self.root.after(0, lambda: messagebox.showerror("Error", "Failed to get Vault session"))
+                self.root.after(0, lambda: self.status_label.config(text="Connection failed"))
+                self.root.after(0, self.progress.stop)
+                return
+            
+            headers_post = {
+                'Accept': 'application/json', 
+                'Authorization': f"Bearer {session_id}",
+                'Content-Type': 'application/json'
+            }
+            
+            # Get fields for this object
+            api_url = f"{self.api_url_var.get()}/api/v24.1/metadata/vobjects/{object_name}"
+            
+            # Use same SSL verification setting
+            response = requests.get(
+                api_url, 
+                headers=headers_post, 
+                verify=self.verify_ssl,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                fields = [field['name'] for field in data['object']['fields']]
+                
+                # Update available fields
+                self.available_vault_fields = fields
+                
+                # If we have an input file loaded, try automapping
+                if self.df is not None and self.operation_var.get() == "push":
+                    self.root.after(0, self.auto_map_columns)
+                
+                self.root.after(0, lambda: self.status_label.config(text="Fields loaded"))
+                self.root.after(0, lambda: self.log_message(f"Loaded {len(fields)} fields for {object_name}"))
+            else:
+                error_msg = f"Failed to get fields: {response.status_code}"
+                self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+                self.root.after(0, lambda: self.status_label.config(text="Error"))
+                self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+        
+        except requests.exceptions.SSLError as e:
+            error_msg = f"SSL Certificate Error: {str(e)}"
+            self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+            self.root.after(0, lambda: messagebox.showerror("SSL Error", "SSL Certificate verification failed. Try disabling SSL verification."))
+            
+        except requests.exceptions.Timeout as e:
+            error_msg = "Connection timed out. The server took too long to respond."
+            self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+            self.root.after(0, lambda: messagebox.showerror("Timeout Error", error_msg))
+            
+        except Exception as e:
+            error_msg = f"Error fetching fields: {str(e)}"
+            self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+            self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+        
+        finally:
+            self.root.after(0, self.progress.stop)
+    
+    def auto_map_columns(self):
+        """Automatically map file columns to Vault fields where possible"""
+        if not self.df is not None or not self.available_vault_fields:
+            messagebox.showinfo("Info", "Please load a file and select a Vault object first")
+            return
+        
+        # Reset mappings
+        self.column_mappings = {}
+        
+        # Create mapping by name match (case insensitive)
+        file_columns = list(self.df.columns)
+        vault_fields_lower = {field.lower(): field for field in self.available_vault_fields}
+        
+        for file_col in file_columns:
+            # Try exact match
+            if file_col in self.available_vault_fields:
+                self.column_mappings[file_col] = file_col
+            # Try case insensitive match
+            elif file_col.lower() in vault_fields_lower:
+                self.column_mappings[file_col] = vault_fields_lower[file_col.lower()]
+            # Try with underscores replaced by spaces and vice versa
+            elif file_col.replace('_', ' ').lower() in vault_fields_lower:
+                self.column_mappings[file_col] = vault_fields_lower[file_col.replace('_', ' ').lower()]
+            elif file_col.replace(' ', '_').lower() in vault_fields_lower:
+                self.column_mappings[file_col] = vault_fields_lower[file_col.replace(' ', '_').lower()]
+        
+        # Populate UI with mappings
+        self.populate_mapping_ui(auto_map=True)
+        
+        # Log results
+        self.log_message(f"Auto-mapped {len(self.column_mappings)}/{len(file_columns)} columns")
+    
+    def populate_mapping_ui(self, auto_map=False):
+        """Populate the mapping UI with file columns and vault fields"""
+        # Clear existing widgets
+        for widget in self.mapping_content.winfo_children():
+            if int(widget.grid_info()['row']) > 0:  # Preserve headers
+                widget.destroy()
+        
+        if self.df is None:
+            return
+        
+        file_columns = list(self.df.columns)
+        
+        # Add rows for each file column
+        for i, col in enumerate(file_columns):
+            # File column label
+            ttk.Label(self.mapping_content, text=col).grid(row=i+1, column=0, padx=5, pady=2, sticky=tk.W)
+            
+            # Vault field dropdown
+            combo = ttk.Combobox(self.mapping_content, values=[""] + self.available_vault_fields, width=30)
+            combo.grid(row=i+1, column=1, padx=5, pady=2, sticky=tk.W)
+            
+            # Set value if we have a mapping
+            if auto_map and col in self.column_mappings:
+                combo.set(self.column_mappings[col])
+            
+            # Store the mapping when changed
+            combo.col_name = col  # Store column name as attribute
+            combo.bind("<<ComboboxSelected>>", self.on_mapping_changed)
+            
+            # Preview data
+            preview_data = ""
+            if len(self.df) > 0:
+                preview_data = str(self.df[col].iloc[0])
+                if len(preview_data) > 30:
+                    preview_data = preview_data[:27] + "..."
+            
+            ttk.Label(self.mapping_content, text=preview_data).grid(row=i+1, column=2, padx=5, pady=2, sticky=tk.W)
+        
+        # Update canvas scroll region
+        self.canvas.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+    
+    def on_mapping_changed(self, event):
+        """Handle mapping selection changes"""
+        combo = event.widget
+        file_col = combo.col_name
+        vault_field = combo.get()
+        
+        if vault_field:
+            self.column_mappings[file_col] = vault_field
+        elif file_col in self.column_mappings:
+            del self.column_mappings[file_col]
+    
+    def clear_mappings(self):
+        """Clear all column mappings"""
+        self.column_mappings = {}
+        
+        # Reset all comboboxes
+        for widget in self.mapping_content.winfo_children():
+            if isinstance(widget, ttk.Combobox):
+                widget.set("")
+        
+        self.log_message("Cleared all column mappings")
+    
+    def test_connection(self):
+        """Test connection to Veeva Vault"""
+        try:
+            self.status_label.config(text="Testing connection...")
+            self.progress.start()
+            
+            # Set SSL verification option from checkbox
+            self.verify_ssl = self.verify_ssl_var.get()
+            
+            session_id = self.get_sessionid()
+            
+            if session_id:
+                messagebox.showinfo("Success", "Successfully connected to Veeva Vault")
+                self.status_label.config(text="Connected")
+                self.log_message("Successfully connected to Veeva Vault")
+            else:
+                messagebox.showerror("Error", "Failed to connect to Veeva Vault. Check your credentials and connection settings.")
+                self.status_label.config(text="Connection failed")
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Connection test failed: {str(e)}")
+            self.status_label.config(text="Connection failed")
+        
+        finally:
+            self.progress.stop()
+    
+    def get_sessionid(self):
+        """Get a session ID from Veeva Vault"""
+        try:
+            data = {
+                'username': self.username_var.get(),
+                'password': self.password_var.get()
+            }
+            
+            auth_url = f"{self.api_url_var.get()}/api/v24.1/auth"
+            
+            # Add SSL verification options
+            self.verify_ssl = getattr(self, 'verify_ssl', True)
+            
+            # Increase timeout and disable SSL verification if needed
+            response = requests.post(
+                auth_url, 
+                data=data, 
+                verify=self.verify_ssl,
+                timeout=30  # Increased timeout
+            )
+            
+            if response.status_code != 200:
+                error_details = ""
+                try:
+                    error_details = f" - Details: {response.json().get('message', 'No details available')}"
+                except:
+                    pass
+                self.log_message(f"Authentication failed: {response.status_code}{error_details}", "ERROR")
+                return None
+            
+            result_session_id = response.json()
+            res = result_session_id.get('sessionId')
+            return res
+        
+        except requests.exceptions.SSLError as e:
+            self.log_message(f"SSL Certificate Error: {str(e)}", "ERROR")
+            
+            # Ask if user wants to try without SSL verification
+            if messagebox.askyesno("SSL Certificate Error", 
+                                 "Failed to verify SSL certificate. Would you like to try connecting without SSL verification?\n\n" +
+                                 "Note: This is less secure but may resolve connection issues."):
+                self.verify_ssl = False
+                return self.get_sessionid()
+            return None
+        
+        except requests.exceptions.Timeout:
+            self.log_message("Connection timed out. The server took too long to respond.", "ERROR")
+            return None
+        
+        except requests.exceptions.ConnectionError as e:
+            self.log_message(f"Connection Error: {str(e)}", "ERROR")
+            return None
+        
+        except Exception as e:
+            self.log_message(f"Failed to get session ID: {str(e)}", "ERROR")
+            return None
+    
+    def show_email_settings(self):
+        """Show email settings dialog"""
+        settings_window = tk.Toplevel(self.root)
+        settings_window.title("Email Settings")
+        settings_window.geometry("400x300")
+        settings_window.transient(self.root)
+        settings_window.resizable(False, False)
+        
+        # Create input fields
+        ttk.Label(settings_window, text="SMTP Server:").grid(row=0, column=0, sticky=tk.W, padx=10, pady=5)
+        smtp_server_var = tk.StringVar(value=self.config.get('Email', 'smtp_server', fallback='10.121.0.205'))
+        ttk.Entry(settings_window, textvariable=smtp_server_var, width=30).grid(row=0, column=1, padx=10, pady=5, sticky=tk.EW)
+        
+        ttk.Label(settings_window, text="Sender Email:").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+        sender_var = tk.StringVar(value=self.config.get('Email', 'sender', fallback=''))
+        ttk.Entry(settings_window, textvariable=sender_var, width=30).grid(row=1, column=1, padx=10, pady=5, sticky=tk.EW)
+        
+        ttk.Label(settings_window, text="Recipient Emails:").grid(row=2, column=0, sticky=tk.W, padx=10, pady=5)
+        recipients_var = tk.StringVar(value=self.config.get('Email', 'recipients', fallback=''))
+        ttk.Entry(settings_window, textvariable=recipients_var, width=30).grid(row=2, column=1, padx=10, pady=5, sticky=tk.EW)
+        ttk.Label(settings_window, text="(Comma separated)").grid(row=2, column=2, sticky=tk.W, padx=5, pady=5)
+        
+        ttk.Label(settings_window, text="CC Emails:").grid(row=3, column=0, sticky=tk.W, padx=10, pady=5)
+        cc_var = tk.StringVar(value=self.config.get('Email', 'cc', fallback=''))
+        ttk.Entry(settings_window, textvariable=cc_var, width=30).grid(row=3, column=1, padx=10, pady=5, sticky=tk.EW)
+        ttk.Label(settings_window, text="(Comma separated)").grid(row=3, column=2, sticky=tk.W, padx=5, pady=5)
+        
+        # Test and Save buttons
+        def test_email():
+            try:
+                smtp_server = smtp_server_var.get()
+                sender = sender_var.get()
+                
+                if not (smtp_server and sender):
+                    messagebox.showerror("Error", "SMTP server and sender email are required")
+                    return
+                
+                # Try to connect to SMTP server
+                smtp_obj = smtplib.SMTP(smtp_server)
+                smtp_obj.quit()
+                
+                messagebox.showinfo("Success", "SMTP server connection successful")
+            except Exception as e:
+                messagebox.showerror("Error", f"SMTP server connection failed: {str(e)}")
+        
+        def save_settings():
+            # Save settings to config
+            if not self.config.has_section('Email'):
+                self.config.add_section('Email')
+            
+            self.config.set('Email', 'smtp_server', smtp_server_var.get())
+            self.config.set('Email', 'sender', sender_var.get())
+            self.config.set('Email', 'recipients', recipients_var.get())
+            self.config.set('Email', 'cc', cc_var.get())
+            
+            with open(CONFIG_FILE, 'w') as f:
+                self.config.write(f)
+            
+            messagebox.showinfo("Success", "Email settings saved")
+            settings_window.destroy()
+        
+        button_frame = ttk.Frame(settings_window)
+        button_frame.grid(row=4, column=0, columnspan=3, pady=20)
+        
+        ttk.Button(button_frame, text="Test Connection", command=test_email).grid(row=0, column=0, padx=10)
+        ttk.Button(button_frame, text="Save", command=save_settings).grid(row=0, column=1, padx=10)
+        ttk.Button(button_frame, text="Cancel", command=settings_window.destroy).grid(row=0, column=2, padx=10)
+        
+        # Configure grid
+        settings_window.columnconfigure(1, weight=1)
+        
+        # Make window modal
+        settings_window.grab_set()
+        settings_window.focus_set()
+        settings_window.wait_window()
+    
+    def execute_operation(self):
+        """Execute the selected operation"""
+        operation = self.operation_var.get()
+        
+        try:
+            self.status_label.config(text="Running...")
+            self.progress.start()
+            
+            # Disable execute button while running
+            for widget in self.root.winfo_children():
+                if isinstance(widget, ttk.Button) and widget['text'] == "Execute":
+                    widget.configure(state='disabled')
+            
+            # Run in background thread
+            if operation == "pull":
+                threading.Thread(target=self._execute_pull, daemon=True).start()
+            else:  # push
+                threading.Thread(target=self._execute_push, daemon=True).start()
+        
+        except Exception as e:
+            self.progress.stop()
+            self.status_label.config(text="Error")
+            messagebox.showerror("Error", f"Execution failed: {str(e)}")
+            
+            # Reeeeeee-enable execute button
+            for widget in self.root.winfo_children():
+                if isinstance(widget, ttk.Button) and widget['text'] == "Execute":
+                    widget.configure(state='normal')
+    
+    def _execute_pull(self):
+        """Execute pull operation in background thread"""
+        try:
+            self.root.after(0, lambda: self.log_message("Starting pull operation..."))
+            
+            # Validate inputs
+            if not self.selected_object_var.get():
+                error_msg = "Please select a Veeva Vault object"
+                self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+                return
+            
+            if not self.output_file_var.get():
+                error_msg = "Please specify an output file"
+                self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+                return
+            
+            # Set SSL verification option from checkbox
+            self.verify_ssl = self.verify_ssl_var.get()
+            
+            # Get session
+            session_id = self.get_sessionid()
+            
+            if not session_id:
+                error_msg = "Failed to get Vault session"
+                self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+                self.root.after(0, lambda: self.status_label.config(text="Failed"))
+                self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+                return
+            
+            headers_post = {
+                'Accept': 'application/json', 
+                'Authorization': f"Bearer {session_id}",
+                'Content-Type': 'application/json'
+            }
+            
+            # Get metadata for this object
+            object_name = self.selected_object_var.get()
+            api_url = f"{self.api_url_var.get()}/api/v24.1/metadata/vobjects/{object_name}"
+            
+            self.root.after(0, lambda: self.log_message(f"Fetching metadata for {object_name}..."))
+            
+            # Use same SSL verification setting
+            request = requests.get(
+                api_url, 
+                headers=headers_post, 
+                verify=self.verify_ssl,
+                timeout=60  # Longer timeout
+            )
+            
+            if request.status_code != 200:
+                error_msg = f"Failed to get metadata: {request.status_code}"
+                self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+                self.root.after(0, lambda: self.status_label.config(text="Failed"))
+                self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+                return
+            
+            response_data = request.json()
+            fields = [record['name'] for record in response_data['object']['fields']]
+            fields_string = ','.join(fields)
+            
+            self.root.after(0, lambda: self.log_message(f"Found {len(fields)} fields for {object_name}"))
+            
+            # Fetch data in batches
+            Limit = 100  # Reduced batch size for better stability
+            Offset = 0
+            all_data = []
+            
+            self.root.after(0, lambda: self.log_message("Fetching records..."))
+            self.root.after(0, lambda: self.status_label.config(text="Fetching records..."))
+            
+            while True:
+                data_url = f"{self.api_url_var.get()}/api/v24.1/vobjects/{object_name}?fields={fields_string}&limit={Limit}&offset={Offset}"
+                
+                try:
+                    request_data = requests.get(
+                        data_url, 
+                        headers=headers_post, 
+                        verify=self.verify_ssl,
+                        timeout=60  # Longer timeout
+                    )
+                    
+                    if request_data.status_code != 200:
+                        error_msg = f"Failed to get data: {request_data.status_code}"
+                        self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+                        self.root.after(0, lambda: self.status_label.config(text="Failed"))
+                        self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+                        return
+                    
+                    data_json = request_data.json()
+                    data = data_json['data']
+                    
+                    if not data:
+                        break
+                    
+                    all_data.extend(data)
+                    Offset += Limit
+                    
+                    # Update progress
+                    self.root.after(0, lambda count=len(all_data): 
+                                  self.status_label.config(text=f"Fetched {count} records..."))
+                
+                except requests.exceptions.Timeout:
+                    self.root.after(0, lambda: self.log_message(
+                        f"Timeout while fetching batch at offset {Offset}. Retrying with smaller batch size...", "WARNING"))
+                    
+                    # Try again with a smaller batch size for this iteration
+                    try:
+                        smaller_limit = 50
+                        data_url = f"{self.api_url_var.get()}/api/v24.1/vobjects/{object_name}?fields={fields_string}&limit={smaller_limit}&offset={Offset}"
+                        
+                        request_data = requests.get(
+                            data_url, 
+                            headers=headers_post, 
+                            verify=self.verify_ssl,
+                            timeout=90  # Even longer timeout
+                        )
+                        
+                        if request_data.status_code == 200:
+                            data_json = request_data.json()
+                            data = data_json['data']
+                            
+                            if not data:
+                                break
+                            
+                            all_data.extend(data)
+                            Offset += smaller_limit
+                            
+                            # Update progress
+                            self.root.after(0, lambda count=len(all_data): 
+                                          self.status_label.config(text=f"Fetched {count} records (slower rate)..."))
+                        else:
+                            error_msg = f"Failed to get data with smaller batch: {request_data.status_code}"
+                            self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+                            # Continue to next batch anyway
+                            Offset += smaller_limit
+                    
+                    except Exception as inner_e:
+                        self.root.after(0, lambda: self.log_message(
+                            f"Error during retry: {str(inner_e)}. Skipping to next batch.", "ERROR"))
+                        # Skip this batch
+                        Offset += smaller_limit
+            
+            # Create dataframe from results
+            if len(all_data) == 0:
+                self.root.after(0, lambda: self.log_message(f"No data found for {object_name}", "WARNING"))
+                df = pd.DataFrame(columns=fields)
+            else:
+                self.root.after(0, lambda: self.log_message(f"Processing {len(all_data)} records..."))
+                
+                # Clean data "replace" square brackets
+                for row in all_data:
+                    for key in row:
+                        if isinstance(row[key], str):
+                            row[key] = row[key].replace('[', '').replace(']', '')
+                
+                df = pd.DataFrame(all_data)
+            
+            # Save to file
+            output_file = self.output_file_var.get()
+            output_format = self.output_format_var.get()
+            
+            self.root.after(0, lambda: self.log_message(f"Saving data to {output_file}..."))
+            
+            if output_format == "csv":
+                df.to_csv(output_file, index=False)
+            else:  # excel
+                df.to_excel(output_file, index=False)
+            
+            # Send email notification if enabled
+            if self.email_notification_var.get():
+                self._send_email_notification("pull", object_name, len(all_data), output_file)
+            
+            # Complete
+            self.root.after(0, lambda: self.status_label.config(text="Completed"))
+            self.root.after(0, lambda: self.log_message(f"Successfully exported {len(all_data)} records to {output_file}"))
+            self.root.after(0, lambda: messagebox.showinfo("Success", f"Successfully exported {len(all_data)} records to {output_file}"))
+        
+        except requests.exceptions.SSLError as e:
+            error_msg = f"SSL Certificate Error: {str(e)}"
+            self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+            self.root.after(0, lambda: messagebox.showerror(
+                "SSL Error", "SSL Certificate verification failed. Try disabling SSL verification."))
+            self.root.after(0, lambda: self.status_label.config(text="Failed"))
+            
+        except requests.exceptions.Timeout as e:
+            error_msg = "Connection timed out. The server took too long to respond."
+            self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+            self.root.after(0, lambda: messagebox.showerror("Timeout Error", error_msg))
+            self.root.after(0, lambda: self.status_label.config(text="Failed"))
+            
+        except Exception as e:
+            error_msg = f"Pull operation failed: {str(e)}\n{traceback.format_exc()}"
+            self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Pull operation failed: {str(e)}"))
+            self.root.after(0, lambda: self.status_label.config(text="Failed"))
+        
+        finally:
+            self.root.after(0, self.progress.stop)
+            
+            # Reenable execute button
+            self.root.after(0, lambda: self._enable_execute_button())
+    
+    def _execute_push(self):
+        """Execute push operation in background thread"""
+        try:
+            operation = self.crud_operation_var.get()
+            self.root.after(0, lambda op=operation: self.log_message(f"Starting {op} operation..."))
+            
+            # Validate input
+            if not self.input_file_var.get():
+                self.root.after(0, lambda: messagebox.showerror("Error", "Please select an input file"))
+                return
+            
+            if not self.selected_object_var.get():
+                self.root.after(0, lambda: messagebox.showerror("Error", "Please select a target Vault object"))
+                return
+            
+            # Only require mapping for non-merge operations
+            if operation != "merge" and not self.column_mappings:
+                self.root.after(0, lambda: messagebox.showerror("Error", "Please map at least one column"))
+                return
+            
+            # Set SSL verification option from checkbox
+            self.verify_ssl = self.verify_ssl_var.get()
+            
+            # Get session
+            session_id = self.get_sessionid()
+            
+            if not session_id:
+                error_msg = "Failed to get Vault session"
+                self.root.after(0, lambda: messagebox.showerror("Error", error_msg))
+                self.root.after(0, lambda: self.status_label.config(text="Failed"))
+                self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+                return
+            
+            headers_post = {
+                'Accept': 'application/json', 
+                'Authorization': f"Bearer {session_id}",
+                'Content-Type': 'application/json'
+            }
+            
+            # Prepare data from input file
+            prepared_data = []
+            log_file = os.path.join(os.path.dirname(self.input_file_var.get()), 
+                                   f"veeva_vault_export_{self.selected_object_var.get()}.log")
+            
+            # Set up logging
+            file_handler = logging.FileHandler(log_file, mode='a')
+            file_logger = logging.getLogger(f"VeevaVault_{self.selected_object_var.get()}")
+            file_logger.setLevel(logging.INFO)
+            file_logger.addHandler(file_handler)
+            
+            # For merge operations, use the data directly without mapping
+            if operation == "merge":
+                # Convert DataFrame directly to list of dictionaries
+                prepared_data = self.df.to_dict(orient='records')
+                # Convert any non-string values to strings
+                for record in prepared_data:
+                    for key, value in record.items():
+                        if pd.isna(value):
+                            record[key] = ""
+                        else:
+                            record[key] = str(value)
+                
+                self.root.after(0, lambda: self.log_message("Using direct data for merge operation - no column mapping applied"))
+            else:
+                # Process each row with column mapping for other operations
+                for _, row in self.df.iterrows():
+                    data_row = {}
+                    for file_col, vault_field in self.column_mappings.items():
+                        if vault_field:  # Skip unmapped columns
+                            # Convert to string and handle NaN/None
+                            value = row[file_col]
+                            if pd.isna(value):
+                                value = ""
+                            else:
+                                value = str(value)
+                            
+                            data_row[vault_field] = value
+                    
+                    prepared_data.append(data_row)
+            
+            self.root.after(0, lambda count=len(prepared_data): 
+                          self.log_message(f"Prepared {count} records for upload"))
+            
+            # Process in batches
+            # Use user selected batch size, with appropriate limits
+            batch_size = min(self.batch_size_var.get(), 10 if operation.lower() == 'merge' else 500)
+            self.root.after(0, lambda bs=batch_size: self.log_message(f"Using batch size: {bs}"))
+            
+            total_batches = (len(prepared_data) + batch_size - 1) // batch_size
+            count = 0
+            success_count = 0
+            
+            for batch_index in range(0, len(prepared_data), batch_size):
+                count += 1
+                batch = prepared_data[batch_index:batch_index + batch_size]
+                json_output = json.dumps(batch)
+                
+                # Use a local variable to avoid lambda capturing the changing count variable
+                current_batch = count
+                self.root.after(0, lambda curr=current_batch, total=total_batches: 
+                              self.status_label.config(text=f"Processing batch {curr} of {total}"))
+                
+                api_url = f"{self.api_url_var.get()}/api/v24.1/vobjects/{self.selected_object_var.get()}"
+                
+                try:
+                    # Use the SSL verification setting for all API calls
+                    if operation.lower() == 'insert':
+                        request = requests.post(
+                            api_url, 
+                            headers=headers_post, 
+                            data=json_output,
+                            verify=self.verify_ssl,
+                            timeout=60
+                        )
+                    elif operation.lower() == 'update':
+                        request = requests.put(
+                            api_url, 
+                            headers=headers_post, 
+                            data=json_output,
+                            verify=self.verify_ssl,
+                            timeout=60
+                        )
+                    elif operation.lower() == 'merge':
+                        api_url = f"{self.api_url_var.get()}/api/v24.1/vobjects/{self.selected_object_var.get()}/actions/merge"
+                        request = requests.post(
+                            api_url, 
+                            headers=headers_post, 
+                            data=json_output,
+                            verify=self.verify_ssl,
+                            timeout=60
+                        )
+                    else:  # delete
+                        request = requests.delete(
+                            api_url, 
+                            headers=headers_post, 
+                            data=json_output,
+                            verify=self.verify_ssl,
+                            timeout=60
+                        )
+                    
+                    if request.status_code == 200:
+                        # Use local variables to avoid lambda capturing the changing variables
+                        batch_num = count
+                        obj = self.selected_object_var.get()
+                        code = request.status_code
+                        self.root.after(0, lambda bn=batch_num, o=obj, c=code: 
+                                      self.log_message(f"Batch {bn} -> Response Status Code for {o} is {c}"))
+                        file_logger.info(f"Logs for Batch {count} - {request.text}")
+                        success_count += 1
+                    else:
+                        error_msg = f"Error: Failed Status Code for {self.selected_object_var.get()} is {request.status_code}"
+                        batch_text = request.text
+                        self.root.after(0, lambda msg=error_msg: self.log_message(msg, "ERROR"))
+                        file_logger.error(error_msg)
+                        file_logger.info(f"Logs for Batch {count} - {batch_text}")
+                
+                except requests.exceptions.SSLError as e:
+                    # Store a safe local copy of the error message
+                    error_str = str(e)
+                    batch_num = count
+                    error_msg = f"SSL Certificate Error in batch {batch_num}: {error_str}"
+                    self.root.after(0, lambda msg=error_msg: self.log_message(msg, "ERROR"))
+                    file_logger.error(error_msg)
+                    
+                    # Create a synchronization event
+                    ssl_verify_response = [None]
+                    
+                    def ask_verify_ssl():
+                        """Ask user about SSL verification in the main thread"""
+                        resp = messagebox.askyesno("SSL Certificate Error", 
+                                              f"SSL Certificate verification failed in batch {batch_num}.\n\nWould you like to disable SSL verification and continue?")
+                        ssl_verify_response[0] = resp
+                    
+                    if self.verify_ssl:
+                        # Ask user in the main thread
+                        self.root.after(0, ask_verify_ssl)
+                        
+                        # Wait for the response (polling)
+                        wait_count = 0
+                        while ssl_verify_response[0] is None and wait_count < 100:  # timeout after ~10 seconds
+                            time.sleep(0.1)
+                            wait_count += 1
+                        
+                        # If user agreed to disable SSL verification
+                        if ssl_verify_response[0]:
+                            self.verify_ssl = False
+                            self.verify_ssl_var.set(False)
+                            # Use after_idle to update the UI from the main thread
+                            self.root.after_idle(lambda: self.log_message("SSL verification disabled for remaining operations", "INFO"))
+                            # Retry this batch with SSL verification disabled
+                            count -= 1  # Decrement to retry the same batch
+                            continue
+                
+                except requests.exceptions.Timeout as e:
+                    batch_num = count
+                    error_msg = f"Connection timeout in batch {batch_num}. The server took too long to respond."
+                    self.root.after(0, lambda msg=error_msg: self.log_message(msg, "ERROR"))
+                    file_logger.error(error_msg)
+                
+                except Exception as e:
+                    batch_num = count
+                    error_str = str(e)
+                    error_msg = f"Error in batch {batch_num}: {error_str}"
+                    self.root.after(0, lambda msg=error_msg: self.log_message(msg, "ERROR"))
+                    file_logger.error(error_msg)
+            
+            # Close logger
+            file_handler.close()
+            
+            # Send email notification if enabled
+            if self.email_notification_var.get():
+                try:
+                    self._send_email_notification("push", self.selected_object_var.get(), len(prepared_data), 
+                                               self.input_file_var.get(), success_count, total_batches)
+                except Exception as e:
+                    self.root.after(0, lambda: self.log_message(f"Failed to send email notification: {str(e)}", "ERROR"))
+            
+            # Report results using safe local variables
+            final_success_count = success_count
+            final_total_batches = total_batches
+            final_operation = operation
+            
+            if final_success_count == final_total_batches:
+                status_msg = f"{final_operation.capitalize()} operation completed successfully. All {final_total_batches} batches processed."
+                self.root.after(0, lambda msg=status_msg: self.log_message(msg))
+                self.root.after(0, lambda msg=status_msg: messagebox.showinfo("Success", msg))
+            else:
+                status_msg = f"{final_operation.capitalize()} operation completed with errors. {final_success_count} of {final_total_batches} batches processed successfully."
+                self.root.after(0, lambda msg=status_msg: self.log_message(msg, "WARNING"))
+                self.root.after(0, lambda msg=status_msg: messagebox.showwarning("Warning", msg))
+            
+            self.root.after(0, lambda: self.status_label.config(text="Completed"))
+            self.root.after(0, lambda file=log_file: self.log_message(f"Log file saved to: {file}"))
+        
+        except requests.exceptions.SSLError as e:
+            error_msg = f"SSL Certificate Error: {str(e)}"
+            self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+            self.root.after(0, lambda: messagebox.showerror(
+                "SSL Error", "SSL Certificate verification failed. Try disabling SSL verification."))
+            self.root.after(0, lambda: self.status_label.config(text="Failed"))
+            
+        except requests.exceptions.Timeout as e:
+            error_msg = "Connection timed out. The server took too long to respond."
+            self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+            self.root.after(0, lambda: messagebox.showerror("Timeout Error", error_msg))
+            self.root.after(0, lambda: self.status_label.config(text="Failed"))
+            
+        except Exception as e:
+            error_msg = f"Push operation failed: {str(e)}\n{traceback.format_exc()}"
+            self.root.after(0, lambda: self.log_message(error_msg, "ERROR"))
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Push operation failed: {str(e)}"))
+            self.root.after(0, lambda: self.status_label.config(text="Failed"))
+        
+        finally:
+            self.root.after(0, self.progress.stop)
+            
+            # Re-enable execute button
+            self.root.after(0, lambda: self._enable_execute_button())
+    
+    def _enable_execute_button(self):
+        """Re-enable the execute button"""
+        for widget in self.root.winfo_children():
+            if isinstance(widget, ttk.Button) and widget['text'] == "Execute":
+                widget.configure(state='normal')
+    
+    def _send_email_notification(self, operation_type, object_name, record_count, file_path, success_batches=None, total_batches=None):
+        """Send email notification"""
+        try:
+            # Thread-safe logging - don't use self.log_message from a background thread
+            thread_safe_log = lambda msg: print(f"Email notification: {msg}")
+            
+            if not self.config.has_section('Email'):
+                # Signal to the main thread to log the message
+                self.root.after(0, lambda: self.log_message("Email configuration not found. Skipping notification.", "WARNING"))
+                return
+            
+            smtp_server = self.config.get('Email', 'smtp_server', fallback='')
+            sender = self.config.get('Email', 'sender', fallback='')
+            recipients_str = self.config.get('Email', 'recipients', fallback='')
+            cc_str = self.config.get('Email', 'cc', fallback='')
+            
+            if not (smtp_server and sender and recipients_str):
+                # Signal to the main thread to log the message
+                self.root.after(0, lambda: self.log_message("Incomplete email configuration. Skipping notification.", "WARNING"))
+                return
+            
+            recipients = [r.strip() for r in recipients_str.split(',') if r.strip()]
+            cc_list = [c.strip() for c in cc_str.split(',') if c.strip()]
+            
+            # Create message
+            thread_safe_log('Creating email message...')
+            message = MIMEMultipart("alternative")
+            
+            if operation_type == "pull":
+                subject = f'Veeva Vault Data Pull Report: {object_name}'
+                content = f"""
+                <html>
+                <body>
+                    <h2>Veeva Vault Data Pull Report</h2>
+                    <p>Below is the summary of the data pull operation:</p>
+                    <table border="1" cellpadding="10" cellspacing="0">
+                    <tr>
+                        <th>Vault Object</th>
+                        <td>{object_name}</td>
+                    </tr>
+                    <tr>
+                        <th>Records Retrieved</th>
+                        <td>{record_count}</td>
+                    </tr>
+                    <tr>
+                        <th>Output File</th>
+                        <td>{file_path}</td>
+                    </tr>
+                    </table>
+                    <br>
+                    <p>This is an automated message from the Veeva Vault Manager.</p>
+                </body>
+                </html>
+                """
+            else:  # push
+                operation = self.crud_operation_var.get()
+                subject = f'Veeva Vault Data {operation.capitalize()} Report: {object_name}'
+                status = "Successful" if success_batches == total_batches else "Partially successful"
+                
+                content = f"""
+                <html>
+                <body>
+                    <h2>Veeva Vault Data {operation.capitalize()} Report</h2>
+                    <p>Below is the summary of the data {operation} operation:</p>
+                    <table border="1" cellpadding="10" cellspacing="0">
+                    <tr>
+                        <th>Vault Object</th>
+                        <td>{object_name}</td>
+                    </tr>
+                    <tr>
+                        <th>Operation</th>
+                        <td>{operation.capitalize()}</td>
+                    </tr>
+                    <tr>
+                        <th>Records Processed</th>
+                        <td>{record_count}</td>
+                    </tr>
+                    <tr>
+                        <th>Input File</th>
+                        <td>{file_path}</td>
+                    </tr>
+                    <tr>
+                        <th>Status</th>
+                        <td>{status}</td>
+                    </tr>
+                    <tr>
+                        <th>Batches</th>
+                        <td>{success_batches} of {total_batches} processed successfully</td>
+                    </tr>
+                    </table>
+                    <br>
+                    <p>This is an automated message from the Veeva Vault Manager.</p>
+                </body>
+                </html>
+                """
+            
+            message['Subject'] = subject
+            message['From'] = sender
+            message['To'] = COMMASPACE.join(recipients)
+            if cc_list:
+                message['Cc'] = COMMASPACE.join(cc_list)
+            
+            send_to = recipients + cc_list
+            message.attach(MIMEText(content, 'html', 'utf-8'))
+            
+            thread_safe_log('Connecting to SMTP server...')
+            
+            # Try to connect with a timeout
+            smtp_obj = smtplib.SMTP(smtp_server, timeout=10)
+            smtp_obj.sendmail(sender, send_to, message.as_string())
+            
+            # Signal to the main thread to log the success message
+            self.root.after(0, lambda: self.log_message("Successfully sent email notification"))
+            thread_safe_log('Email sent successfully')
+        
+        except Exception as e:
+            # Signal to the main thread to log the error message
+            error_msg = f"Error: unable to send email: {str(e)}"
+            thread_safe_log(error_msg)
+            self.root.after(0, lambda err=error_msg: self.log_message(err, "ERROR"))
+    
+    def save_configuration(self):
+        """Save current configuration to config.ini"""
+        try:
+            if not self.config.has_section('Connection'):
+                self.config.add_section('Connection')
+            
+            self.config.set('Connection', 'api_url', self.api_url_var.get())
+            self.config.set('Connection', 'username', self.username_var.get())
+            self.config.set('Connection', 'password', self.password_var.get())
+            self.config.set('Connection', 'verify_ssl', str(self.verify_ssl_var.get()))
+            
+            with open(CONFIG_FILE, 'w') as f:
+                self.config.write(f)
+            
+            self.log_message("Configuration saved successfully")
+            messagebox.showinfo("Success", "Configuration saved successfully")
+        
+        except Exception as e:
+            self.log_message(f"Failed to save configuration: {str(e)}", "ERROR")
+            messagebox.showerror("Error", f"Failed to save configuration: {str(e)}")
+    
+    def load_saved_config(self):
+        """Load saved configuration if available"""
+        try:
+            if os.path.exists(CONFIG_FILE):
+                self.config.read(CONFIG_FILE)
+                
+                if self.config.has_section('Connection'):
+                    self.api_url_var.set(self.config.get('Connection', 'api_url', fallback=''))
+                    self.username_var.set(self.config.get('Connection', 'username', fallback=''))
+                    self.password_var.set(self.config.get('Connection', 'password', fallback=''))
+                    
+                    # Load SSL verification setting
+                    verify_ssl = self.config.get('Connection', 'verify_ssl', fallback='True')
+                    self.verify_ssl_var.set(verify_ssl.lower() == 'true')
+                
+                self.log_message("Loaded saved configuration")
+        
+        except Exception as e:
+            self.log_message(f"Failed to load configuration: {str(e)}", "WARNING")
+    
+    def show_help(self):
+        """Show help information"""
+        help_text = """
+Veeva Vault Manager Help
+
+This application provides a GUI interface for pulling data from and pushing data to Veeva Vault using CSV or Excel files.
+
+Connection Configuration:
+- API URL: The Veeva Vault API URL (e.g., https://yourcompany.veevavault.com)
+- Username: Your Veeva Vault username
+- Password: Your Veeva Vault password
+- Verify SSL Certificate: Enable/disable SSL certificate verification (disable if having connection issues)
+
+Troubleshooting Connection Issues:
+- If you see SSL certificate errors, try unchecking the "Verify SSL Certificate" option
+- For timeout errors, the application will automatically retry with smaller batch sizes
+- If connection problems persist, check your network configuration or proxy settings
+
+Operations:
+- Pull: Download data from Veeva Vault to a CSV or Excel file
+- Push: Upload data from a CSV or Excel file to Veeva Vault objects
+  - Insert: Add new records
+  - Update: Update existing records
+  - Delete: Remove records
+  - Merge: Update or insert records (upsert)
+
+For push operations, you need to map your file columns to Vault fields.
+Auto-mapping will match columns by name where possible.
+
+Email Notifications:
+To enable email notifications, check the 'Send email notification' option
+and configure email settings with the 'Email Settings' button.
+
+For more information, see the documentation.
+"""
+        
+        help_window = tk.Toplevel(self.root)
+        help_window.title("Veeva Vault Manager Help")
+        help_window.geometry("700x500")
+        
+        text = scrolledtext.ScrolledText(help_window, wrap=tk.WORD, background=SECTION_BG, foreground=TEXT_COLOR)
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        text.insert(tk.END, help_text)
+        text.configure(state="disabled")
+    
+    def on_closing(self):
+        """Handle window closing event"""
+        if messagebox.askokcancel("Quit", "Do you want to quit?"):
+            self.root.destroy()
+
+
+class TextHandler(logging.Handler):
+    """Custom logging handler that writes to a tkinter Text widget"""
+    def __init__(self, text_widget):
+        logging.Handler.__init__(self)
+        self.text_widget = text_widget
+        
+        # Set up formatter
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        self.setFormatter(formatter)
+    
+    def emit(self, record):
+        msg = self.format(record)
+        
+        def append():
+            self.text_widget.configure(state='normal')
+            
+            # Apply color based on log level
+            tag = None
+            if record.levelno >= logging.ERROR:
+                tag = "error"
+                self.text_widget.tag_config("error", foreground=ERROR_COLOR)
+            elif record.levelno >= logging.WARNING:
+                tag = "warning"
+                self.text_widget.tag_config("warning", foreground=WARNING_COLOR)
+            elif record.levelno >= logging.INFO:
+                tag = "info"
+                self.text_widget.tag_config("info", foreground=INFO_COLOR)
+            
+            self.text_widget.insert(tk.END, msg + '\n', tag)
+            self.text_widget.see(tk.END)  # Scroll to the bottom
+            self.text_widget.configure(state='disabled')
+        
+        # Schedule to run in the main thread
+        self.text_widget.after(0, append)
+
+
+def main():
+    """Main entry point for the application"""
+    root = tk.Tk()
+    app = VeevaVaultManager(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
