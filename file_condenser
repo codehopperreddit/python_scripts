@@ -1,0 +1,63 @@
+import os
+import sys
+
+def compile_files(root_dir, output_file):
+    """
+    Recursively traverse a directory, extract text from all files,
+    and compile them into a single file
+    """
+    # List to store all text files that were successfully processed
+    processed_files = []
+    
+    # Walk through the directory tree
+    for dirpath, _, filenames in os.walk(root_dir):
+        for filename in filenames:
+            file_path = os.path.join(dirpath, filename)
+            
+            try:
+                # Try to read the file as text
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    
+                # Store the path and content for successful reads
+                rel_path = os.path.relpath(file_path, root_dir)
+                processed_files.append((rel_path, content))
+            except (UnicodeDecodeError, PermissionError, IsADirectoryError):
+                # Skip binary files, permission issues, etc.
+                print(f"Skipping file: {file_path}")
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+    
+    # Write all processed files to the output file
+    with open(output_file, 'w', encoding='utf-8') as out_f:
+        for i, (file_path, content) in enumerate(processed_files):
+            # For the first file use "<file path>", for others use "<next file path>"
+            if i == 0:
+                out_f.write("<file path>\n")
+            else:
+                out_f.write("<next file path>\n")
+                
+            out_f.write(f"// {file_path}\n")
+            out_f.write("<file content>\n")
+            out_f.write(content)
+            
+            # Ensure there's a newline at the end if needed
+            if not content.endswith('\n'):
+                out_f.write('\n')
+    
+    print(f"Successfully compiled {len(processed_files)} files to {output_file}")
+
+def main():
+    
+    
+    root_dir = "path"
+    output_file = "final.txt"
+    
+    if not os.path.isdir(root_dir):
+        print(f"Error: {root_dir} is not a valid directory")
+        sys.exit(1)
+    
+    compile_files(root_dir, output_file)
+
+if __name__ == "__main__":
+    main()
